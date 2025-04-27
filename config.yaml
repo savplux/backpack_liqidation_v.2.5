@@ -1,0 +1,134 @@
+# Main account configuration - where funds will return after liquidation
+main_account:
+  address: "___"
+
+# API credentials for the main account
+api:                      
+  key: "___"
+  secret: "___"
+
+symbol: "SOL_USDC_PERP"        # точное имя рынка
+initial_deposit: "10"           # USDC на цикл
+
+# Задержки после выхода из режима переставления ЛИМИТОК между монитронгом.
+check_interval: 30             # сек
+
+# Trading pairs configuration
+pairs:
+  - short_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+    long_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+  - short_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+    long_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+  - short_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+    long_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+  - short_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+    long_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+  - short_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+    long_account:
+      name: "__"
+      address: "__"
+      api_key: "__"
+      api_secret: "__"
+
+
+# сколько раз повторить выставление maker-ордера, прежде чем сдаться
+limit_order_retries: 120
+
+# смещение (%) от лучшего bid/ask для maker-ордера
+maker_offset:
+  long: 0.0001    # для первой (short) ордера: отступаем от bid на ___%
+  short: 0.0001   # для первой (long) ордера: отступаем от ask на ___%
+
+# сколько секунд ждать fill-таймаута для LIMIT-ордера
+limit_order_timeout: 30
+
+# offset (в той же валюте цены) для тейк-профита
+take_profit_offset:
+  long: 0.05      # например, для лонг-позиции TP = (liq_price_opposite + __ USDC)
+  short: 0.05    # для шорт-позиции TP = (liq_price_opposite - __ USDC)
+
+# сколько попыток свипа баланса делать в конце цикла
+sweep_attempts: 10
+
+# Общие задержки между действиями
+general_delay:
+  min: 10
+  max: 20
+
+# Плечо
+leverage: 50
+
+# Время ожидания между циклами в секундах
+cycle_wait_time: 10  # сек
+
+# максимальная задержка между запуском пар в секундах
+pair_start_delay_max: 120  
+
+# Отклонения
+fluctuation:
+  
+  # N секунд для измерения дельты и для начального измерения хода цены
+  window_seconds: 30          
+  
+  # абсолютная дельта в USDC
+  thresholds_usdc: 
+    too_weak:   0.01    # слишком слабые колебания          
+    weak:       0.025   #  — слабые колебания
+    medium:     0.05    #  — средние
+    strong:     0.1     #  — сильные
+    too_strong: 0.20    # слишком сильные
+  
+  # смещение TP от цены ликвидации: 
+  # 1. Отрицательное значение = закрытие РАНЬШЕ, чем ликвидация произойдет 
+  # 2. Положительное значение = закрытие ПОЗЖЕ, чем ликвидация произойдет 
+  offsets:
+      too_weak:   -0.02        # при очень слабых колебаниях          
+      weak:        0.00        # при слабых колебаниях 
+      medium:      0.05        # при средних колебаниях 
+      strong:      0.075        # при сильных колебаниях
+      too_strong:  0.10        # при очень сильных колебаниях  
+  
+  # если цена в +- N значении (в USDC) от liq_price — не смещать TP
+  close_price_usdc: 0.2  
+
+# Прокси
+proxy:
+  enabled: true                    # true/false - использовать прокси или нет
+  url: "___"     # формат: login:pass:domain:port  
+       
