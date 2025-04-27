@@ -21,7 +21,7 @@ def sweep_all(cfg_path: str):
     )
 
     # Читаем конфиг
-    with open(cfg_path, 'r') as f:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     # Инициализируем и патчим SDK для работы через прокси
@@ -160,7 +160,7 @@ def sweep_all(cfg_path: str):
         datefmt="%Y-%m-%d %H:%M:%S"
     )
 
-    with open(cfg_path, 'r') as f:
+    with open(cfg_path, 'r', encoding='utf-8') as f:
         cfg = yaml.safe_load(f)
 
     # Загрузка задержек из конфига
@@ -204,4 +204,5 @@ def sweep_all(cfg_path: str):
 if __name__ == '__main__':
     cfg_path = sys.argv[1] if len(sys.argv) > 1 else 'config.yaml'
     sweep_all(cfg_path)
+
 
