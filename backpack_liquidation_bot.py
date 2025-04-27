@@ -635,37 +635,49 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                     
                 logging.info(f"{long_acc_name}: Long maker order {oid}@{price}, qty={qty}")
 
-                # 3) Ожидаем заполнения
+                # 3) Ожидаем заполнения — ускоренный вариант
                 start_ts = time.time()
                 order_filled = False
-                last_check = 0
-                while time.time() - start_ts < limit_to:
-                    now = time.time()
-                    if now - last_check >= 2:
-                        last_check = now
-                        pos = long_tr.get_position(symbol)
-                        new_size = abs(float(pos.get("netQuantity", 0))) if pos else 0
-                        if new_size > current_size:
-                            s_l = float(pos.get("netQuantity", 0))
-                            e_l = float(pos.get("entryPrice", 0))
-                            m_l = float(pos.get("markPrice", 0))
-                            l_l = pos.get("estLiquidationPrice", "Unknown")
-                            pnl_l = pos.get("unrealizedPnl", "---")
-                            logging.info(f"{long_acc_name}: {symbol}, size={s_l:.2f} (~{abs(s_l*e_l):.2f} USDC), entry={e_l}, mark={m_l}, liq={l_l}, PnL={pnl_l}")
-                            
-                            if abs(new_size - qty) < step or new_size >= target_long_size:
-                                logging.info(f"{long_acc_name}: Order fully filled")
-                                order_filled = True
-                            long_position_opened = True
-                            break
 
+                # Интервал опроса в секундах (например, 0.2—0.5)
+                poll_interval = cfg.get("order_poll_interval", 0.3)
+                deadline = start_ts + limit_to
+
+                while time.time() < deadline:
+                    # 1) Сразу пробуем узнать статус ордера
                     status = long_tr.check_order_status(symbol, oid)
                     if status == "FILLED":
                         logging.info(f"{long_acc_name}: Order {oid} filled")
                         order_filled = True
                         long_position_opened = True
                         break
-                    time.sleep(1)
+
+                    # 2) Проверяем изменение позиции (вдруг был частичный филл)
+                    pos = long_tr.get_position(symbol)
+                    new_size = abs(float(pos.get("netQuantity", 0))) if pos else 0
+                    if new_size > current_size:
+                        s_l = float(pos.get("netQuantity", 0))
+                        e_l = float(pos.get("entryPrice", 0))
+                        m_l = float(pos.get("markPrice", 0))
+                        l_l = pos.get("estLiquidationPrice", "Unknown")
+                        pnl_l = pos.get("unrealizedPnl", "---")
+                        logging.info(
+                            f"{long_acc_name}: {symbol}, "
+                            f"size={s_l:.2f} (~{abs(s_l*e_l):.2f} USDC), "
+                            f"entry={e_l}, mark={m_l}, liq={l_l}, PnL={pnl_l}"
+                        )
+                        if abs(new_size - qty) < step or new_size >= target_long_size:
+                            logging.info(f"{long_acc_name}: Order fully filled")
+                            order_filled = True
+                        long_position_opened = True
+                        break
+
+                    # 3) Ждём перед следующим опросом
+                    time.sleep(poll_interval)
+
+                if not order_filled:
+                    logging.warning(f"{long_acc_name}: Order {oid} not filled within {limit_to}s, proceeding with timeout handling")
+
 
                 # 4) При таймауте — отменяем и проверяем частичное
                 if not order_filled:
