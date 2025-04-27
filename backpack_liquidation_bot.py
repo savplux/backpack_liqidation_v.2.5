@@ -1112,6 +1112,21 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                 end_price   = mid
                 delta_usdc  = fm.get_relative_delta()
 
+                # --- НОВАЯ ЛОГИКА: не двигать TP, если price близко к liq ---
+                close_thr = float(cfg.get('close_price_usdc', 0))
+                # liq_short и liq_long уже определены чуть выше в цикле
+                if abs(end_price - liq_short) <= close_thr or abs(end_price - liq_long) <= close_thr:
+                    # Логируем, что TP не меняем из-за близости цены к одной из цен ликвидации
+                    logging.info(
+                        f"[DynamicTP] Skipping TP adjustment: "
+                        f"end_price={end_price:.2f}, "
+                        f"liq_short={liq_short:.2f}, liq_long={liq_long:.2f}, "
+                        f"threshold={close_thr:.2f}"
+                    )
+                    last_adjust = now
+                    continue
+                # --- КОНЕЦ новой логики ---
+
                 # лог окна с 3 знаками
                 logging.info(f"[DynamicTP] window={window}s start={start_price:.3f} end={end_price:.3f}")
                 logging.info(f"[DynamicTP] delta={delta_usdc:.4f} USDC")
