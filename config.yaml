@@ -133,5 +133,5 @@ fluctuation:
 # Прокси
 proxy:
   enabled: true                    # true/false - использовать прокси или нет
-  url: "___"     # формат: login:pass@domain:port  
+  url: "___"     # формат: login:pass:domain:port 
        
