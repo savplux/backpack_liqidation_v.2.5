@@ -13,6 +13,9 @@ initial_deposit: "10"           # USDC на цикл
 # Задержки после выхода из режима переставления ЛИМИТОК между монитронгом.
 check_interval: 30             # сек
 
+# проверяем заполненность лимитной позиции каждые N секунды
+order_poll_interval: 0.3  # секунды
+
 # Trading pairs configuration
 pairs:
   - short_account:
