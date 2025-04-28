@@ -16,6 +16,10 @@ check_interval: 30             # сек
 # проверяем заполненность лимитной позиции каждые N секунды
 order_poll_interval: 0.3  # секунды
 
+deviation:
+  # Максимальное отклонение от initial_deposit в долях (пример 0.01 = 1%)
+  max_deviation: 0.05
+
 # Trading pairs configuration
 pairs:
   - short_account:
