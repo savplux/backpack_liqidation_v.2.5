@@ -363,6 +363,8 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                 for side in ("short_account", "long_account"):
                     acc = pair_cfg[side]
                     acc_name = acc["name"]
+                    # трейдер для саб-акка
+                    sub_trader = BackpackTrader(acc["api_key"], acc["api_secret"])
                     
                     # Точная сумма депозита из конфига
                     deposit_amount = initial_dep
@@ -409,15 +411,13 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                                 tx_id = result.get("id", "unknown")
                                 status = result.get("status", "unknown")
                                 
-                                logging.info(f"[Deposit] {acc_name}: Deposit details:"
-                                        f"\n- Requested: {qty_str} USDC"
-                                        f"\n- Actual: {actual_amount} USDC"
-                                        f"\n- ID: {tx_id}"
-                                        f"\n- Status: {status}")
-                                
-                                # Если суммы не совпадают, выводим предупреждение
-                                if str(actual_amount) != qty_str:
-                                    logging.warning(f"[Deposit] {acc_name}: AMOUNT MISMATCH! Requested: {qty_str}, Actual: {actual_amount}")
+                                # вместо двух логов — один, и считаем 1.000000 == 1
+                                mismatch = abs(float(actual_amount) - float(qty_str)) > 0
+                                logging.info(
+                                    f"[Deposit] {acc_name}: requested={qty_str} USDC, actual={actual_amount} USDC, "
+                                    f"id={tx_id}, status={status}"
+                                    f"{' – AMOUNT MISMATCH!' if mismatch else ''}"
+                                )
                             else:
                                 logging.info(f"[Deposit] {acc_name}: deposited {qty_str} USDC, unexpected response format: {result}")
                             
@@ -426,6 +426,43 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                             logging.info(f"[Deposit] {acc_name}: sleeping for {sleep_time:.2f}s before next action")
                             time.sleep(sleep_time)
                             
+                            # --- Проверяем баланс суб-акка через max_deviation из конфига и, при необходимости, ресетим ---
+                            # читаем допустимую дельту (доля от initial_dep), по умолчанию 1%
+                            max_dev = float(cfg.get("deviation", {}).get("max_deviation", 0.01))
+                            # получаем текущий доступный баланс суб-акка
+                            sub_bal = float(sub_trader.get_available_margin() or 0)
+                            expected = initial_dep
+                            tol = expected * max_dev
+                            if abs(sub_bal - expected) > tol:
+                                logging.warning(
+                                    f"[Deposit] {acc_name}: баланс {sub_bal:.6f} выходит за пределы "
+                                    f"[{expected - tol:.6f}…{expected + tol:.6f}], делаем sweep"
+                                )
+                                # 1) свипим всё обратно на родителя
+                                sweep_qty = f"{sub_bal:.6f}"
+                                parent.request_withdrawal(
+                                    address=cfg["api"]["parent_address"],
+                                    blockchain="Solana",
+                                    quantity=sweep_qty,
+                                    symbol="USDC"
+                                )
+                                logging.info(f"[Sweep] {acc_name}: swept {sweep_qty} USDC обратно на родителя")
+                                # 2) заново депонируем ровно initial_dep
+                                retry_qty = f"{initial_dep:.6f}"
+                                parent.request_withdrawal(
+                                    address=acc["address"],
+                                    blockchain="Solana",
+                                    quantity=retry_qty,
+                                    symbol="USDC"
+                                )
+                                logging.info(f"[Deposit] {acc_name}: повторный депозит EXACTLY {retry_qty} USDC")
+                                # ждём завершения операций
+                                time.sleep(cfg.get("sweep_wait_seconds", 5))
+                            else:
+                                logging.info(
+                                    f"[Deposit] {acc_name}: баланс {sub_bal:.6f} в пределах допустимого отклонения ±{tol:.6f}"
+                                )
+
                             break  # успешный депозит → выходим из попыток
                         except Exception as e:
                             logging.warning(f"[Deposit] {acc_name}: attempt {attempt} failed: {e}")
@@ -1441,7 +1478,7 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
 
 def get_account_pnl_data(trader, acc_name, symbol):
     """
-    Получает данные о PnL и комиссиях для аккаунта, используя различные API эндпоинты.
+    Получает данные о PnL и комиссиях для последней закрытой позиции.
     
     Args:
         trader: Объект BackpackTrader для доступа к API
@@ -1455,183 +1492,82 @@ def get_account_pnl_data(trader, acc_name, symbol):
         pnl = 0.0
         fees = 0.0
         
-        # Метод 1: Попытка получить позицию напрямую
-        position_found = False
+        # Проверяем текущую позицию
         pos = trader.get_position(symbol)
-        if pos and isinstance(pos, dict) and pos.get("symbol") == symbol:
-            position_found = True
-            pnl = float(pos.get("realizedPnl", 0) or 0)
-            logger.info(f"{acc_name}: Found current position data - Realized PnL={pnl:.6f}")
+        if pos and isinstance(pos, dict):
+            logging.info(f"{acc_name}: Данные позиции: {pos}")
             
-            # Если realizedPnl = 0, проверяем unrealizedPnl
-            if pnl == 0 and "unrealizedPnl" in pos:
-                pnl = float(pos.get("unrealizedPnl", 0) or 0)
-                logger.info(f"{acc_name}: Using unrealized PnL={pnl:.6f}")
-                
-        # Метод 2: Попытка получить историю через другие эндпоинты
-        if not position_found or pnl == 0:
-            # Попробуем /api/v1/fill (история сделок)
+            # Проверяем realizedPnl в текущей позиции
+            if "realizedPnl" in pos and pos.get("realizedPnl") is not None:
+                pnl = float(pos.get("realizedPnl", 0) or 0)
+                logging.info(f"{acc_name}: Реализованный PnL из позиции: {pnl:.6f}")
+            
+            # Проверяем комиссии
+            if "commission" in pos:
+                fees = float(pos.get("commission", 0) or 0)
+                logging.info(f"{acc_name}: Комиссии из позиции: {fees:.6f}")
+        else:
+            logging.warning(f"{acc_name}: Не удалось получить данные о позиции {symbol}")
+        
+        # Если не получили PnL из текущей позиции, пробуем запросить историю позиций
+        if pnl == 0:
             try:
-                # Используем эндпоинт сделок (fills) вместо позиций
-                fills = trader.auth._send_request(
+                # Пробуем использовать правильный эндпоинт из документации
+                positions_history = trader.auth._send_request(
                     "GET", 
-                    "api/v1/fill", 
-                    "fillQuery", 
-                    {"symbol": symbol, "limit": 50}
+                    "api/v1/positions/history", 
+                    "positionsHistoryQuery", 
+                    {"symbol": symbol, "limit": 1}
                 )
                 
-                if fills and isinstance(fills, (list, dict)):
-                    data = fills
-                    if isinstance(fills, dict) and "data" in fills:
-                        data = fills["data"]
-                        
+                if positions_history and isinstance(positions_history, (list, dict)):
+                    data = positions_history
+                    if isinstance(positions_history, dict) and "data" in positions_history:
+                        data = positions_history["data"]
+                    
                     if data and len(data) > 0:
-                        logger.info(f"{acc_name}: Found {len(data)} fills")
-                        # Суммируем PnL и комиссии от всех сделок
-                        for fill in data:
-                            if fill.get("symbol") == symbol:
-                                fill_pnl = float(fill.get("realizedPnl", 0) or 0)
-                                fill_fee = float(fill.get("fee", 0) or 0)
-                                pnl += fill_pnl
-                                fees += fill_fee
-                                
-                        logger.info(f"{acc_name}: Calculated from fills - PnL={pnl:.6f}, Fees={fees:.6f}")
-                        position_found = True
+                        last_position = data[0]
+                        logging.info(f"{acc_name}: Получена последняя позиция из истории: {last_position}")
+                        
+                        # Извлекаем PnL
+                        if "realizedPnl" in last_position:
+                            pnl = float(last_position.get("realizedPnl", 0) or 0)
+                            logging.info(f"{acc_name}: PnL из истории позиций: {pnl:.6f}")
+                        
+                        # Извлекаем комиссии
+                        if "commission" in last_position or "fee" in last_position:
+                            fees = float(last_position.get("commission", 0) or last_position.get("fee", 0) or 0)
+                            logging.info(f"{acc_name}: Комиссии из истории позиций: {fees:.6f}")
             except Exception as e:
-                logger.warning(f"{acc_name}: Error accessing fills: {e}")
-                
-        # Метод 3: Попытка получить информацию о комиссиях
-        if fees == 0:
+                logging.warning(f"{acc_name}: Ошибка при запросе истории позиций: {e}")
+        
+        # Если комиссии все еще не найдены, используем типичную оценку
+        if fees == 0.0 and pnl != 0.0:
+            fees = abs(pnl) * 0.001  # Примерно 0.1% от объема торгов
+            logging.warning(f"{acc_name}: Используем оценочные комиссии: {fees:.6f}")
+        
+        # Последняя попытка - запрашиваем баланс и сравниваем с предыдущим
+        if pnl == 0.0:
             try:
-                # Попробуем получить историю ордеров
-                orders = trader.auth._send_request(
+                # Запрашиваем баланс
+                balance_info = trader.auth._send_request(
                     "GET", 
-                    "api/v1/order/history", 
-                    "orderHistoryQuery", 
-                    {"symbol": symbol, "limit": 50}
+                    "api/v1/capital", 
+                    "capitalQuery", 
+                    {}
                 )
                 
-                if orders and isinstance(orders, (list, dict)):
-                    data = orders
-                    if isinstance(orders, dict) and "data" in orders:
-                        data = orders["data"]
-                        
-                    if data and len(data) > 0:
-                        logger.info(f"{acc_name}: Found {len(data)} orders")
-                        # Собираем информацию о комиссиях
-                        for order in data:
-                            if order.get("symbol") == symbol:
-                                order_fee = float(order.get("fee", 0) or 0)
-                                fees += order_fee
-                                
-                        logger.info(f"{acc_name}: Calculated fees from orders: {fees:.6f}")
+                logging.info(f"{acc_name}: Данные баланса: {balance_info}")
+                # Здесь можно добавить логику для вычисления PnL на основе изменений баланса
+                # Но для этого нужно знать предыдущий баланс
             except Exception as e:
-                logger.warning(f"{acc_name}: Error accessing order history: {e}")
+                logging.warning(f"{acc_name}: Ошибка при запросе баланса: {e}")
         
-        # Метод 4: Попытка получить информацию из истории транзакций
-        if not position_found or pnl == 0 or fees == 0:
-            try:
-                # Попробуем получить историю транзакций
-                transactions = trader.auth._send_request(
-                    "GET", 
-                    "api/v1/transaction", 
-                    "transactionQuery", 
-                    {"limit": 50}
-                )
-                
-                if transactions and isinstance(transactions, (list, dict)):
-                    data = transactions
-                    if isinstance(transactions, dict) and "data" in transactions:
-                        data = transactions["data"]
-                        
-                    if data and len(data) > 0:
-                        logger.info(f"{acc_name}: Found {len(data)} transactions")
-                        # Ищем транзакции, связанные с PnL или комиссиями
-                        for tx in data:
-                            if tx.get("type") == "REALIZED_PNL":
-                                # Предполагаем, что есть поле amount или подобное
-                                tx_pnl = float(tx.get("amount", 0) or 0)
-                                pnl += tx_pnl
-                            elif tx.get("type") == "FEE":
-                                tx_fee = float(tx.get("amount", 0) or 0)
-                                fees += tx_fee
-                                
-                        logger.info(f"{acc_name}: Calculated from transactions - PnL={pnl:.6f}, Fees={fees:.6f}")
-            except Exception as e:
-                logger.warning(f"{acc_name}: Error accessing transaction history: {e}")
-        
-        # Метод 5: Попробуем напрямую API для позиционной истории
-        try:
-            # Это специфический эндпоинт, который может быть доступен
-            position_history = trader.auth._send_request(
-                "GET", 
-                "api/v1/position/closed", 
-                "closedPositionQuery", 
-                {"symbol": symbol, "limit": 10}
-            )
-            
-            if position_history and isinstance(position_history, (list, dict)):
-                data = position_history
-                if isinstance(position_history, dict) and "data" in position_history:
-                    data = position_history["data"]
-                    
-                if data and len(data) > 0:
-                    logger.info(f"{acc_name}: Found {len(data)} closed positions")
-                    # Берем последнюю закрытую позицию
-                    last_position = data[0]
-                    history_pnl = float(last_position.get("realizedPnl", 0) or 0)
-                    history_fees = float(last_position.get("fee", 0) or last_position.get("totalFees", 0) or 0)
-                    
-                    # Если мы нашли какую-то сумму, используем ее
-                    if history_pnl != 0:
-                        pnl = history_pnl
-                    if history_fees != 0:
-                        fees = history_fees
-                        
-                    logger.info(f"{acc_name}: Data from closed positions - PnL={pnl:.6f}, Fees={fees:.6f}")
-                    position_found = True
-        except Exception as e:
-            logger.warning(f"{acc_name}: Error accessing closed positions: {e}")
-        
-        # Если до сих пор у нас нет данных, пробуем получить остальные эндпоинты API
-        # Это перебор возможных путей API, которые могут содержать нужную информацию
-        if not position_found or (pnl == 0 and fees == 0):
-            possible_endpoints = [
-                "api/v1/account/pnl",
-                "api/v1/position/all",
-                "api/v1/position/summary",
-                "api/v1/trading/pnl"
-            ]
-            
-            for endpoint in possible_endpoints:
-                try:
-                    response = trader.auth._send_request(
-                        "GET", 
-                        endpoint, 
-                        endpoint.replace("/", "_"), 
-                        {"symbol": symbol}
-                    )
-                    
-                    if response and isinstance(response, (list, dict)):
-                        logger.info(f"{acc_name}: Successfully queried {endpoint}")
-                        # Если получили ответ, пытаемся извлечь pnl и fees
-                        # Логика извлечения зависит от формата ответа
-                        # ...
-                        
-                except Exception:
-                    pass  # Тихо игнорируем ошибки при поиске подходящих эндпоинтов
-        
-        # Если комиссии все еще не найдены, используем приблизительную оценку
-        if fees == 0.0:
-            # Используем типичный размер комиссии на биржах - обычно 0.1% от объема сделки
-            fees = abs(pnl) * 0.001
-            logger.warning(f"{acc_name}: Using estimated fees based on PnL: {fees:.6f}")
-        
-        logger.info(f"{acc_name}: Final data - PnL={pnl:.6f}, Fees={fees:.6f}")
+        logging.info(f"{acc_name}: Итоговые данные - PnL={pnl:.6f}, Комиссии={fees:.6f}")
         return pnl, fees
         
     except Exception as e:
-        logger.error(f"{acc_name}: Failed to get PnL data: {e}")
+        logging.error(f"{acc_name}: Не удалось получить данные PnL: {e}")
         traceback.print_exc()
         return 0.0, 0.0
     
@@ -1686,3 +1622,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
