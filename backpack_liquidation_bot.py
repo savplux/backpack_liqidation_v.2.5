@@ -7,6 +7,12 @@ import yaml
 import math
 import traceback
 import threading
+import json
+import websocket
+import hmac
+import hashlib
+from urllib.parse import urlencode
+from datetime import datetime, timedelta
 
 # Добавить импорт модуля обработки прокси
 from proxy_handler import patch_sdk_clients, init_proxy_from_config
@@ -19,8 +25,11 @@ import os, csv, time, logging
 from collections import deque
 from datetime import datetime
 
-# Отключение root логгера полностью
-logging.getLogger().handlers = []
+# ДЛЯ def close_position_market
+FETCH_RETRIES      = 3       # сколько раз пробуем получить позиции
+FETCH_RETRY_DELAY  = 1       # пауза между попытками (сек)
+CLOSE_RETRIES      = 3       # сколько раз пробуем выставить ордер на закрытие
+CLOSE_RETRY_DELAY  = 1       # пауза между попытками закрытия (сек)
 
 # --- FluctuationMonitor: собирает последние N секунд цен и считает дельту ---
 class FluctuationMonitor:
@@ -56,6 +65,518 @@ if not os.path.exists(LOG_FILE):
             'level','offset',
             'tp_short','tp_long'
         ])
+
+# Добавьте в начало файла (рядом с другими хелперами)
+def _wait_for_sweep_confirmation(parent, tx_id: str, timeout: int = 60, poll_interval: float = 5.0):
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            status = parent._send_request(
+                "GET", "api/v1/transaction", "txStatusQuery", {"txId": tx_id}
+            ).get("status", "")
+        except Exception:
+            status = ""
+        if status.lower() == "confirmed":
+            return True
+        logging.info(f"[Sweep] waiting for tx {tx_id} confirmation, status={status}")
+        time.sleep(poll_interval)
+    raise TimeoutError(f"Sweep tx {tx_id} not confirmed within {timeout}s")
+
+
+# -------------------- WebSocket PnL Tracker --------------------
+class PnLWebSocketTracker:
+    """
+    Класс для отслеживания unrealized PnL через веб-сокеты.
+    Подключается к приватным веб-сокетам Backpack Exchange и отслеживает обновления позиций.
+    """
+    def __init__(self, api_key, api_secret, symbol, name):
+        self.api_key = api_key
+        self.api_secret = api_secret
+        self.symbol = symbol        # ← новый атрибут
+        self.name = name          # ← новый атрибут
+        self.ws = None
+        self.pnl_data = {}  # Словарь для хранения данных PnL по символам
+        self.position_updates = {}  # Словарь для хранения последних обновлений позиций
+        self.last_update_time = {}  # Время последнего обновления для каждого символа
+        self.running = False
+        self.ws_thread = None
+        self.lock = threading.Lock()  # Блокировка для безопасного доступа к данным
+        self.ping_thread = None
+        self.connection_time = None
+        self.current_unrealized_pnl = 0.0   # ← новое поле
+
+    def generate_signature(self, params_dict):
+        """Генерирует подпись для аутентификации веб-сокета."""
+        # Сортируем параметры по ключу
+        sorted_params = sorted(params_dict.items())
+        query_string = urlencode(sorted_params)
+        
+        # Создаем подпись
+        signature = hmac.new(
+            self.api_secret.encode(),
+            query_string.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        
+        return signature
+
+    def on_message(self, ws, message):
+        try:
+            msg = json.loads(message)
+        except json.JSONDecodeError:
+            logging.warning(f"WebSocket: не JSON: {message}")
+            return
+
+        # 1) Дебаг всех сообщений
+        logging.debug(f"[WS RAW] {msg}")
+
+        # 2) После успешного auth — подписываемся
+        if msg.get("event") == "auth" and msg.get("success") is True:
+            sub_msg = json.dumps({
+                "op": "subscribe",
+                "args": [f"position.{self.symbol}"]
+            })
+            ws.send(sub_msg)
+            logging.info(f"WebSocket: Подписка на position.{self.symbol} отправлена после авторизации")
+            return
+
+        # 3) Разбор обновлений позиций
+        if msg.get("table") == "position" or msg.get("topic") == "position":
+            for pos in msg.get("data", []):
+                    if pos.get("symbol") != self.symbol:
+                        continue
+
+                    size = float(pos.get("size", 0))
+
+                    # 1) При закрытии позиции — сбрасываем PnL, запускаем трекер, если не запущен
+                    if size == 0:
+                        with self.lock:
+                            # сбрасываем PnL в 0 во всех хранилищах
+                            self.current_unrealized_pnl = 0.0
+                            self.pnl_data[self.symbol] = 0.0
+                            self.last_update_time[self.symbol] = time.time()
+                        logging.info(f"{self.name}: Позиция закрыта, PnL сброшен в 0")
+                        # lazy-создаем и стартуем трекер только после закрытия
+                        if not self.running:
+                            logging.info(f"{self.name}: Старт WebSocket-трекера после закрытия позиции")
+                            self.start()
+                        continue
+
+                    # 2) При первой полученной цене для вновь открытой позиции — тоже стартуем
+                    if size > 0 and not self.running:
+                        logging.info(f"{self.name}: Обнаружена открытая позиция, старт WebSocket-трекера")
+                        self.start()
+
+                    # 3) Обновляем unrealized PnL
+                    pnl = pos.get("unrealizedPnl") or pos.get("unrealized_pnl")
+                    if pnl is None:
+                        logging.debug(f"[WS POS KEYS] {list(pos.keys())}")
+                        continue
+
+                    val = float(pnl)
+                    with self.lock:
+                        self.current_unrealized_pnl = val
+                        self.pnl_data[self.symbol] = val
+                        self.last_update_time[self.symbol] = time.time()
+                    logging.info(f"{self.name}: Текущий unrealized PnL открытой позиции: {val}")
+                    return
+            
+            # Если дошли сюда — открытой позиции нет или в данных не было нужного символа
+            self.current_unrealized_pnl = 0.0
+            logging.info(f"{self.name}: Открытой позиции нет, unrealized PnL = 0.0")
+
+    def on_error(self, ws, error):
+        """Обрабатывает ошибки веб-сокета."""
+        logging.error(f"WebSocket: Ошибка: {error}")
+        # При ошибке попробуем переподключиться через некоторое время
+        if self.running:
+            time.sleep(5)
+            self.connect()
+
+    def on_close(self, ws, close_status_code, close_msg):
+        """Обрабатывает закрытие соединения веб-сокета."""
+        logging.info(f"WebSocket: Соединение закрыто (код: {close_status_code}, сообщение: {close_msg})")
+        # При закрытии соединения попробуем переподключиться, если до сих пор работаем
+        if self.running:
+            time.sleep(5)
+            self.connect()
+
+    def on_open(self, ws):
+        logging.info("Websocket connected")
+        auth_msg = json.dumps({
+            "op": "auth",
+            "args": [self.api_key, self.api_secret]
+        })
+        ws.send(auth_msg)
+        logging.info("WebSocket: Запрос аутентификации отправлен")
+
+        # Теперь сразу подписываемся на позицию для нашего символа
+        sub_msg = json.dumps({
+            "op": "subscribe",
+            "args": [f"position.{self.symbol}"]
+        })
+        ws.send(sub_msg)
+        logging.info(f"WebSocket: Подписка на position.{self.symbol} отправлена (on_open)")
+
+    def _ping_thread(self):
+        """Поток для отправки PING сообщений серверу для поддержания соединения."""
+        while self.running and self.ws and self.ws.sock:
+            try:
+                ping_message = {"op": "ping"}  # Исправлено с {"type": "PING"}
+                self.ws.send(json.dumps(ping_message))
+                logging.debug("WebSocket: PING отправлен")
+                time.sleep(30)  # Отправляем PING каждые 30 секунд
+            except Exception as e:
+                logging.error(f"WebSocket: Ошибка отправки PING: {e}")
+                break
+
+    def connect(self):
+        """Устанавливает соединение с WebSocket API Backpack Exchange."""
+        websocket.enableTrace(True)
+
+        # Правильный endpoint WebSocket API (вместо устаревшего stream.backpack.exchange)
+        ws_url = "wss://ws.backpack.exchange"  # :contentReference[oaicite:0]{index=0}
+
+        self.ws = websocket.WebSocketApp(
+            ws_url,
+            on_open=self.on_open,
+            on_message=self.on_message,
+            on_error=self.on_error,
+            on_close=self.on_close
+        )
+
+        # Запускаем WebSocket в отдельном потоке, с автоматической отправкой PING каждые 30 сек
+        self.ws_thread = threading.Thread(
+            target=lambda: self.ws.run_forever(ping_interval=30),
+            daemon=True
+        )
+        self.ws_thread.start()
+        logging.info(f"WebSocket: Запущен в отдельном потоке на {ws_url}")
+
+    def start(self):
+        """Запускает отслеживание PnL через веб-сокеты."""
+        if self.running:
+            logging.warning("WebSocket: Уже запущен")
+            return
+            
+        self.running = True
+        self.connect()
+        logging.info("WebSocket: Отслеживание PnL запущено")
+
+    def stop(self):
+        """Останавливает отслеживание PnL."""
+        self.running = False
+        if self.ws:
+            self.ws.close()
+        self.ping_thread = threading.Thread(target=self._ping_thread, daemon=True)
+        self.ping_thread.start()
+        logging.info("WebSocket: Отслеживание PnL остановлено")
+
+    def get_unrealized_pnl(self, symbol):
+        """
+        Возвращает текущий unrealized PnL для указанного символа.
+        
+        Args:
+            symbol: Символ торговой пары (например, SOL_USDC_PERP)
+            
+        Returns:
+            float: Текущий unrealized PnL или None, если данные недоступны
+        """
+        with self.lock:
+            # Проверяем, есть ли данные для символа
+            if symbol in self.pnl_data:
+                # Проверяем, не устарели ли данные (не старше 60 секунд)
+                if symbol in self.last_update_time:
+                    last_update = self.last_update_time[symbol]
+                    if time.time() - last_update > 60:
+                        logging.warning(f"WebSocket: Данные PnL для {symbol} устарели (последнее обновление: {datetime.fromtimestamp(last_update)})")
+                        return None
+                return self.pnl_data[symbol]
+            return None
+
+    def get_position_data(self, symbol):
+        """
+        Возвращает полные данные о позиции для указанного символа.
+        
+        Args:
+            symbol: Символ торговой пары (например, SOL_USDC_PERP)
+            
+        Returns:
+            dict: Полные данные о позиции или None, если данные недоступны
+        """
+        with self.lock:
+            if symbol in self.position_updates:
+                # Проверяем, не устарели ли данные (не старше 60 секунд)
+                if symbol in self.last_update_time:
+                    last_update = self.last_update_time[symbol]
+                    if time.time() - last_update > 60:
+                        logging.warning(f"WebSocket: Данные позиции для {symbol} устарели (последнее обновление: {datetime.fromtimestamp(last_update)})")
+                        return None
+                return self.position_updates[symbol]
+            return None
+
+# Создаем глобальный словарь для хранения экземпляров трекеров PnL для каждого аккаунта
+ws_pnl_trackers = {}
+
+def get_or_create_pnl_tracker(api_key, api_secret, account_name, symbol):
+    # ключ остаётся таким же, чтобы tracker.lookup срабатывал правильно
+    key = api_key + symbol
+    if key not in ws_pnl_trackers:
+        logging.info(f"{account_name}: Инициализация и запуск WebSocket трекера PnL")
+        tracker = PnLWebSocketTracker(api_key, api_secret, symbol, account_name)
+        tracker.start()  # ← сразу подключаемся и подписываемся
+        tracker.start()  # ← сразу создаём соединение и подписываемся на обновления
+        ws_pnl_trackers[key] = tracker
+    return ws_pnl_trackers[key]
+
+def get_unrealized_pnl_websocket(trader, account_name, symbol):
+    """
+    Получает текущий unrealized PnL для указанного символа через веб-сокеты.
+    
+    Args:
+        trader: Объект BackpackTrader для получения API ключа и секрета
+        account_name: Имя аккаунта для логирования
+        symbol: Символ торговой пары (например, SOL_USDC_PERP)
+        
+    Returns:
+        float: Текущий unrealized PnL или None, если данные недоступны
+    """
+    try:
+        # Получаем API ключ и секрет из объекта trader
+        # В объекте AuthenticationClient ключи хранятся по-другому
+        # Исправляем доступ к ключам
+        api_key = None
+        api_secret = None
+        
+        # Проверяем доступность ключей напрямую в trader
+        if hasattr(trader, "api_key") and hasattr(trader, "api_secret"):
+            api_key = trader.api_key
+            api_secret = trader.api_secret
+        # Проверяем доступность через auth объект с учетом разных возможных названий атрибутов
+        elif hasattr(trader, "auth"):
+            auth = trader.auth
+            # Прямые атрибуты
+            if hasattr(auth, "api_key") and hasattr(auth, "api_secret"):
+                api_key = auth.api_key
+                api_secret = auth.api_secret
+            # Через _auth_credentials в некоторых версиях SDK
+            elif hasattr(auth, "_auth_credentials"):
+                credentials = auth._auth_credentials
+                api_key = credentials.get("apiKey") or credentials.get("api_key")
+                api_secret = credentials.get("secret") or credentials.get("api_secret")
+            # Через конфигурацию
+            elif hasattr(auth, "config"):
+                config = auth.config
+                api_key = config.get("apiKey") or config.get("api_key")
+                api_secret = config.get("secret") or config.get("api_secret")
+        
+        # Если не смогли найти ключи
+        if not api_key or not api_secret:
+            logging.error(f"{account_name}: Не удалось получить API ключи для WebSocket")
+            return None
+            
+        # Получаем или создаем трекер PnL
+        tracker = get_or_create_pnl_tracker(api_key, api_secret, account_name, symbol)
+        # на всякий случай: если из-за каких-то причин трекер ещё не запущен — стартанём его
+        if not tracker.running:
+            logging.info(f"{account_name}: WS-трекер не был запущен, запускаем его")
+            tracker.start()
+       
+        # Получаем unrealized PnL
+        pnl = tracker.get_unrealized_pnl(symbol)
+        
+        if pnl is not None:
+            logging.info(f"{account_name}: Получен unrealized PnL через WebSocket: {pnl}")
+            return pnl
+        else:
+            logging.warning(f"{account_name}: Не удалось получить unrealized PnL через WebSocket")
+            return None
+    except Exception as e:
+        logging.error(f"{account_name}: Ошибка при получении unrealized PnL через WebSocket: {e}")
+        traceback.print_exc()
+        return None
+    
+# Добавляю новую функцию для получения PnL закрытой позиции через правильный API эндпоинт
+def get_closed_position_pnl(trader, account_name, symbol=None):
+    """
+    Получает PnL последней закрытой позиции с помощью API запроса к /wapi/v1/history/settlement
+    с правильным методом подписи 'settlementHistoryQueryAll'
+    
+    Args:
+        trader: Объект BackpackTrader для доступа к API
+        account_name: Имя аккаунта для логирования
+        symbol: Опциональный символ торговой пары для фильтрации
+        
+    Returns:
+        float: Реализованный PnL последней закрытой позиции или None в случае ошибки
+    """
+    try:
+        logging.info(f"{account_name}: Запрос PnL последней закрытой позиции через /wapi/v1/history/settlement")
+        
+        # Параметры запроса - получаем только последние записи, отсортированные по убыванию (новые в начале)
+        params = {
+            "limit": 5,  # Ограничиваем самыми последними записями
+            "source": "RealizePnl",  # Фильтрация по типу RealizePnl
+            "sortDirection": "Desc"  # Сортировка по убыванию - новые позиции первыми
+        }
+        
+        if symbol:
+            params["symbol"] = symbol
+            
+        # Запрос к API с правильным методом подписи 'settlementHistoryQueryAll'
+        for attempt in range(1, 4):  # 3 попытки
+            try:
+                settlement_history = trader.auth._send_request(
+                    "GET", 
+                    "wapi/v1/history/settlement", 
+                    "settlementHistoryQueryAll",  # Правильное название метода для подписи
+                    params
+                )
+                
+                if settlement_history:
+                    logging.info(f"{account_name}: Успешно получены данные settlement history (попытка {attempt})")
+                    break
+            except Exception as e:
+                logging.warning(f"{account_name}: Ошибка при запросе settlement history (попытка {attempt}): {e}")
+                if attempt < 3:
+                    time.sleep(2)
+                    
+                # Если это последняя попытка, пробуем без параметра source
+                if attempt == 2:
+                    params.pop("source", None)
+                    logging.info(f"{account_name}: Последняя попытка без параметра source")
+                    
+                if attempt == 3:
+                    # Если все попытки не удались, возвращаем None
+                    return None
+        
+        logging.info(f"{account_name}: Получен ответ от API settlement: {settlement_history}")
+        
+        # Парсинг ответа API
+        if settlement_history and isinstance(settlement_history, (list, dict)):
+            data = settlement_history
+            if isinstance(settlement_history, dict) and "data" in settlement_history:
+                data = settlement_history["data"]
+            
+            if isinstance(data, list) and len(data) > 0:
+                # Берем первую запись (самую свежую, так как используем sortDirection=Desc)
+                first_entry = data[0]
+                
+                # Проверяем, что это запись типа RealizePnl
+                if first_entry.get("source") == "RealizePnl" or not "source" in params:
+                    # Получаем значение PnL из поля quantity
+                    amount = float(first_entry.get("quantity", 0) or 0)
+                    settlement_time = first_entry.get("timestamp", "unknown")
+                    entry_symbol = first_entry.get("symbol", "unknown")
+                    
+                    logging.info(f"{account_name}: Найдена запись RealizePnl: сумма={amount}, "
+                                f"время={settlement_time}, символ={entry_symbol}")
+                    return amount
+                else:
+                    logging.warning(f"{account_name}: Первая запись не содержит source=RealizePnl: {first_entry}")
+                    
+                    # Ищем первую запись с source=RealizePnl
+                    for entry in data:
+                        if entry.get("source") == "RealizePnl":
+                            amount = float(entry.get("quantity", 0) or 0)
+                            settlement_time = entry.get("timestamp", "unknown")
+                            entry_symbol = entry.get("symbol", "unknown")
+                            
+                            logging.info(f"{account_name}: Найдена запись RealizePnl: сумма={amount}, "
+                                        f"время={settlement_time}, символ={entry_symbol}")
+                            return amount
+                            
+                logging.warning(f"{account_name}: Не найдено записей с source=RealizePnl в истории расчетов")
+            else:
+                logging.warning(f"{account_name}: Не найдено записей в истории расчетов")
+        else:
+            logging.warning(f"{account_name}: Некорректный формат ответа API: {settlement_history}")
+        
+        # Если не удалось получить PnL через API settlement, 
+        # возвращаем None и будем использовать альтернативный метод
+        return None
+    except Exception as e:
+        logging.error(f"{account_name}: Ошибка при получении PnL закрытой позиции: {e}")
+        traceback.print_exc()
+        return None
+
+def close_position_market(trader, symbol, _, account_name):
+    """
+    Закрывает открытую позицию рыночным ордером (reduceOnly) с ретраями
+    и добивает остатки по минимальному шагу.
+    """
+    # 1) Получаем список позиций с несколькими попытками
+    for attempt in range(1, FETCH_RETRIES + 1):
+        try:
+            logging.info(f"[Action] Fetching positions for {symbol} (attempt {attempt}/{FETCH_RETRIES})")
+            positions = trader.auth._send_request(
+                "GET", "api/v1/position", "positionQuery", {}
+            )
+            break
+        except Exception as e:
+            logging.error(f"[Error] Fetching positions: {e}")
+            if attempt < FETCH_RETRIES:
+                time.sleep(FETCH_RETRY_DELAY)
+            else:
+                return False
+
+    # 2) Пробегаем по всем позициям и ищем нашу
+    for pos in positions:
+        if pos.get("symbol") != symbol:
+            continue
+
+        size = float(pos.get("netQuantity", 0))
+        if size == 0:
+            logging.info(f"[Info] No position for {symbol}")
+            return True
+
+        side = "Ask" if size > 0 else "Bid"
+        abs_size = abs(size)
+
+        # 3) Пытаемся закрыть в один ордер полным объёмом
+        for close_attempt in range(1, CLOSE_RETRIES + 1):
+            try:
+                logging.info(
+                    f"[Action] Closing position {symbol}, size={size}, "
+                    f"side={side} (try {close_attempt})"
+                )
+                trader.auth.execute_order(
+                    orderType="Market",
+                    side=side,
+                    symbol=symbol,
+                    quantity=str(abs_size),
+                    reduceOnly=True
+                )
+                logging.info(f"[Success] Sent market-close for {symbol}, size={size}")
+
+                # небольшая задержка после удачного отправления (фиксированный 1 сек)
+                time.sleep(1)
+
+                # 4) Проверяем, осталась ли «хвостовая» позиция
+                # Если позиция исчезла или ≤ одного шага лота — OK
+                current = trader.get_position(symbol) or {}
+                rem = abs(float(current.get("netQuantity", 0) or 0))
+                # узнаём шаг лота
+                m = trader.auth._send_request("GET", "api/v1/markets", "marketQuery", {})
+                mkts = m.get("data", m) if isinstance(m, dict) else m
+                step = next((float(x.get("baseIncrement", 0.01)) for x in mkts if x.get("symbol")==symbol), 0.01)
+                if rem <= step:
+                    logging.info(f"[Info] Position {symbol} fully closed (remaining {rem:.6f} <= step {step})")
+                    return True
+                # иначе — пытаемся закрыть остаток
+                abs_size = rem
+                logging.info(f"[Info] Residual {rem:.6f} remains, retrying close")
+                continue
+
+            except Exception as err:
+                logging.error(f"[Error] Closing position {symbol}: {err}")
+                if close_attempt < CLOSE_RETRIES:
+                    time.sleep(CLOSE_RETRY_DELAY)
+                else:
+                    return False
+
+    logging.info(f"[Info] Symbol {symbol} not in positions")
+    return True
 
 def pair_worker(pair: dict, cfg: dict):
     short_name = pair["short_account"]["name"]
@@ -347,6 +868,12 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
         gmax            = float(cfg.get("general_delay", {}).get("max", 0))
         sweep_tries     = int(cfg.get("sweep_attempts", 8))
         initial_dep     = float(cfg.get("initial_deposit", 0))
+
+        # Получаем настройки для новой логики закрытия по PnL
+        pnl_diff_check_delay = int(cfg.get("pnl_diff", {}).get("check_delay_seconds", 10))
+        pnl_diff_min_threshold = float(cfg.get("pnl_diff", {}).get("min_threshold", -1.0))
+        pnl_diff_max_threshold = float(cfg.get("pnl_diff", {}).get("max_threshold", 2.0))
+        pnl_diff_recheck_interval = int(cfg.get("pnl_diff", {}).get("recheck_interval_seconds", 30))
         
         # === ИНИЦИАЛИЗАЦИЯ ТРЕЙДЕРОВ И ИМЁН ===
         sa_cfg = pair_cfg["short_account"]
@@ -356,6 +883,36 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
         short_acc_name = sa_cfg.get("name", "ShortAccount")
         long_acc_name  = la_cfg.get("name", "LongAccount")
 
+        # Сохраняем API ключи для WebSocket
+        websocket_keys = {
+            "short": {
+                "api_key": sa_cfg["api_key"], 
+                "api_secret": sa_cfg["api_secret"],
+                "name": short_acc_name
+            },
+            "long": {
+                "api_key": la_cfg["api_key"], 
+                "api_secret": la_cfg["api_secret"],
+                "name": long_acc_name
+            }
+        }
+      
+        def get_pnl_from_tracker(side, symbol):
+            api_key    = websocket_keys[side]["api_key"]
+            api_secret = websocket_keys[side]["api_secret"]
+            name       = websocket_keys[side]["name"]
+
+            # Получаем (создаём) трекер по ключу api_key+symbol, но не стартуем его сразу
+            tracker = get_or_create_pnl_tracker(api_key, api_secret, name, symbol)
+            pnl = tracker.get_unrealized_pnl(symbol)
+            if pnl is not None:
+                logging.info(f"{name}: Получен unrealized PnL через WebSocket: {pnl}")
+            else:
+                logging.warning(f"{name}: Нет данных unrealized PnL для {symbol}")
+            return pnl
+            
+            return None
+        
         try:
             # Функция депозита в фоне
             def do_deposits():
@@ -434,36 +991,56 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
                             expected = initial_dep
                             tol = expected * max_dev
                             if abs(sub_bal - expected) > tol:
+                                # 1) формируем строку для свипа из текущего баланса sub-акка
+                                sweep_qty = f"{sub_bal:.6f}"
                                 logging.warning(
                                     f"[Deposit] {acc_name}: баланс {sub_bal:.6f} выходит за пределы "
-                                    f"[{expected - tol:.6f}…{expected + tol:.6f}], делаем sweep"
+                                    f"[{expected - tol:.6f}…{expected + tol:.6f}], инициируем sweep qty={sweep_qty}"
                                 )
-                                # 1) свипим всё обратно на родителя
-                                sweep_qty = f"{sub_bal:.6f}"
-                                parent.request_withdrawal(
-                                    address=cfg["api"]["parent_address"],
+                                # делаем свип с sub-акка на главный аккаунт
+                                sub_client = AuthenticationClient(acc["api_key"], acc["api_secret"])
+                                res = sub_client.request_withdrawal(
+                                    address=cfg["main_account"]["address"],
                                     blockchain="Solana",
                                     quantity=sweep_qty,
                                     symbol="USDC"
                                 )
-                                logging.info(f"[Sweep] {acc_name}: swept {sweep_qty} USDC обратно на родителя")
-                                # 2) заново депонируем ровно initial_dep
+                                tx_id = res.get("id", "")
+                                logging.info(f"[Sweep] {acc_name}: initiated sweep tx={tx_id}, qty={sweep_qty}")
+
+                                # Вместо опроса статуса — просто короткая пауза
+                                sleep_time = random.uniform(
+                                    cfg["general_delay"]["min"],
+                                    cfg["general_delay"]["max"]
+                                )
+                                logging.info(f"[Sleep] пауза {sleep_time:.2f}s после sweep")
+                                time.sleep(sleep_time)
+
+                                # 2) формируем строку для повторного депозита
                                 retry_qty = f"{initial_dep:.6f}"
-                                parent.request_withdrawal(
+                                logging.info(f"[Deposit] {acc_name}: после sweep делаем депозит qty={retry_qty}")
+                                res2 = parent.request_withdrawal(
                                     address=acc["address"],
                                     blockchain="Solana",
                                     quantity=retry_qty,
                                     symbol="USDC"
                                 )
-                                logging.info(f"[Deposit] {acc_name}: повторный депозит EXACTLY {retry_qty} USDC")
-                                # ждём завершения операций
-                                time.sleep(cfg.get("sweep_wait_seconds", 5))
-                            else:
-                                logging.info(
-                                    f"[Deposit] {acc_name}: баланс {sub_bal:.6f} в пределах допустимого отклонения ±{tol:.6f}"
-                                )
+                                tx2 = res2.get("id", "")
+                                logging.info(f"[Deposit] {acc_name}: повторный депозит qty={retry_qty}, tx={tx2}")
 
-                            break  # успешный депозит → выходим из попыток
+                                # Вместо ожидания подтверждения — короткая рандомная пауза перед следующим действием
+                                sleep_time = random.uniform(
+                                    cfg["general_delay"]["min"],
+                                    cfg["general_delay"]["max"]
+                                )
+                                logging.info(f"[Sleep] пауза {sleep_time:.2f}s после повторного депозита")
+                                time.sleep(sleep_time)
+
+                                # выход из цикла попыток
+                                break
+                            else:
+                                logging.info(f"[Deposit] {acc_name}: баланс {sub_bal:.6f} в пределах допустимого ±{tol:.6f}")
+                                break
                         except Exception as e:
                             logging.warning(f"[Deposit] {acc_name}: attempt {attempt} failed: {e}")
                             traceback.print_exc()  # Печатаем полный стектрейс для отладки
@@ -1320,72 +1897,238 @@ def process_pair(pair_cfg: dict, cfg: dict, pair_number: int, cycle_number: int)
             time.sleep(sampling)
 
 
-        # 5) Monitor until both positions closed
+        # 5) Monitor until both positions closed or PnL difference condition met
         max_monitor_time = 3600 * 24  # 24 hours maximum monitoring time
         start_monitoring = time.time()
         # Интервал между проверками из конфига, по умолчанию 30
         check_int = int(cfg.get("check_interval", 30))
 
-        short_acc_name = sa_cfg.get("name", "ShortAccount")
-        long_acc_name = la_cfg.get("name", "LongAccount")
+        # Получаем настройки для логики закрытия по PnL
+        pnl_diff_check_delay = int(cfg.get("pnl_diff", {}).get("check_delay_seconds", 10))
+        pnl_diff_min_threshold = float(cfg.get("pnl_diff", {}).get("min_threshold", -1.0))
+        pnl_diff_max_threshold = float(cfg.get("pnl_diff", {}).get("max_threshold", 2.0))
+        pnl_diff_recheck_interval = int(cfg.get("pnl_diff", {}).get("recheck_interval_seconds", 30))
 
-        try:
-            while time.time() - start_monitoring < max_monitor_time:
+        # Вспомогательная функция для получения PnL из трекера веб-сокетов
+        def get_pnl_from_tracker(side, symbol):
+            """
+            Получает unrealized PnL из соответствующего трекера.
+            
+            Args:
+                side: "short" или "long" для указания нужного трекера
+                symbol: Символ торговой пары
+                
+            Returns:
+                float: unrealized PnL или None, если данные недоступны
+            """
+            global ws_pnl_trackers
+            
+            # Получаем ключ трекера из конфигурации
+            if side == "short":
+                api_key = sa_cfg["api_key"]
+            else:
+                api_key = la_cfg["api_key"]
+            
+            # Проверяем наличие трекера
+            if api_key in ws_pnl_trackers:
+                tracker = ws_pnl_trackers[api_key]
+                pnl = tracker.get_unrealized_pnl(symbol)
+                if pnl is not None:
+                    acc_name = short_acc_name if side == "short" else long_acc_name
+                    logging.info(f"{acc_name}: Получен unrealized PnL через WebSocket: {pnl}")
+                    return pnl
+            
+            return None
+
+        # Флаги для отслеживания состояния позиций
+        was_short_active = True  # Изначально считаем обе позиции активными
+        was_long_active = True
+        closed_position_pnl = None
+        closed_position_account = None
+        time_position_closed = None
+
+        while time.time() - start_monitoring < max_monitor_time:
+            short_pos = short_tr.get_position(symbol)
+            long_pos = long_tr.get_position(symbol)
+            
+            # Check if positions exist
+            short_active = short_pos and abs(float(short_pos.get("netQuantity", 0) or 0)) > 0.01
+            long_active = long_pos and abs(float(long_pos.get("netQuantity", 0) or 0)) > 0.01
+            
+            # Log position details if active
+            if short_active:
+                s = float(short_pos.get("netQuantity", 0))
+                e = float(short_pos.get("entryPrice", 0))
+                m = float(short_pos.get("markPrice", 0))
+                l = short_pos.get("estLiquidationPrice", "Unknown")
+                
+                # Пытаемся получить unrealized PnL через веб-сокеты
+                websocket_pnl = get_pnl_from_tracker("short", symbol)
+                if websocket_pnl is not None:
+                    pnl = websocket_pnl
+                else:
+                    # Если через веб-сокеты не удалось - используем значение из API
+                    pnl = float(short_pos.get("unrealizedPnl", 0) or 0)
+                
+                logging.info(f"{short_acc_name}: Short position: size={s:.2f}, entry={e}, mark={m}, liquidation={l}, PnL={pnl}")
+            else:
+                logging.info(f"{short_acc_name}: No active short position found")
+            
+            if long_active:
+                s = float(long_pos.get("netQuantity", 0))
+                e = float(long_pos.get("entryPrice", 0))
+                m = float(long_pos.get("markPrice", 0))
+                l = long_pos.get("estLiquidationPrice", "Unknown")
+                
+                # Пытаемся получить unrealized PnL через веб-сокеты
+                websocket_pnl = get_pnl_from_tracker("long", symbol)
+                if websocket_pnl is not None:
+                    pnl = websocket_pnl
+                else:
+                    # Если через веб-сокеты не удалось - используем значение из API
+                    pnl = float(long_pos.get("unrealizedPnl", 0) or 0)
+                    
+                logging.info(f"{long_acc_name}: Long position: size={s:.2f}, entry={e}, mark={m}, liquidation={l}, PnL={pnl}")
+            else:
+                logging.info(f"{long_acc_name}: No active long position found")
+            
+            # Проверяем, закрылась ли одна из позиций (но не обе)
+            if was_short_active and not short_active and long_active:
+                logging.info(f"{short_acc_name}: Позиция закрылась, запускаем логику проверки PnL")
+                time_position_closed = time.time()
+                closed_position_account = "short"
+                was_short_active = False
+            elif was_long_active and not long_active and short_active:
+                logging.info(f"{long_acc_name}: Позиция закрылась, запускаем логику проверки PnL")
+                time_position_closed = time.time()
+                closed_position_account = "long"
+                was_long_active = False
+            
+            # Логика проверки PnL если одна позиция закрылась
+            if time_position_closed is not None and closed_position_account is not None:
+                # Определяем объекты для закрытой и открытой позиций
+                closed_trader = short_tr if closed_position_account == "short" else long_tr
+                closed_acc_name = short_acc_name if closed_position_account == "short" else long_acc_name
+                open_trader = long_tr if closed_position_account == "short" else short_tr
+                open_acc_name = long_acc_name if closed_position_account == "short" else short_acc_name
+                open_position = long_pos if closed_position_account == "short" else short_pos
+                open_side = "long" if closed_position_account == "short" else "short"
+                
+                # Проверяем, прошло ли нужное время после закрытия позиции
+                time_since_close = time.time() - time_position_closed
+                
+                if time_since_close >= pnl_diff_check_delay and closed_position_pnl is None:
+                    # Получаем PnL закрытой позиции через API settlement
+                    closed_position_pnl = get_closed_position_pnl(closed_trader, closed_acc_name, symbol)
+                    logging.info(f"{closed_acc_name}: Получен PnL закрытой позиции из settlement API: {closed_position_pnl}")
+                    
+                    # Если не удалось получить, попробуем другим методом
+                    if closed_position_pnl is None:
+                        logging.warning(f"{closed_acc_name}: Не удалось получить PnL через settlement API, используем альтернативный метод")
+                        pnl_value, _ = get_account_pnl_data(closed_trader, closed_acc_name, symbol)
+                        closed_position_pnl = pnl_value
+                        logging.info(f"{closed_acc_name}: Альтернативный PnL закрытой позиции: {closed_position_pnl}")
+                        
+                        # Если все равно не удалось получить PnL
+                        if closed_position_pnl is None:
+                            logging.warning(f"{closed_acc_name}: Не удалось получить PnL. Используем последнее известное значение.")
+                            # Если у нас нет PnL, можно использовать альтернативную логику
+                            if not open_active:  # Если открытая позиция тоже закрылась
+                                logging.info("Обе позиции уже закрыты. Продолжаем без проверки PnL.")
+                                time_position_closed = None
+                                closed_position_pnl = None
+                                closed_position_account = None
+                                continue
+                
+                # Если уже получили PnL закрытой позиции, проверяем условия
+                if closed_position_pnl is not None:
+                    # Пытаемся получить unrealized PnL через веб-сокеты
+                    websocket_pnl = get_pnl_from_tracker(open_side, symbol)
+                    if websocket_pnl is not None:
+                        open_pnl = websocket_pnl
+                        logging.info(f"{open_acc_name}: Unrealized PnL через WebSocket: {open_pnl:.6f}")
+                    else:
+                        # Фолбэк: считаем PnL "вручную" по позиции из API
+                        size  = float(open_position.get("netQuantity", 0) or 0)
+                        entry = float(open_position.get("entryPrice",   0) or 0)
+                        mark  = float(open_position.get("markPrice",    0) or 0)
+                        # для лонга PnL = (mark – entry) * size, для шорта — наоборот
+                        if open_side == "long":
+                            manual_pnl = (mark - entry) * size
+                        else:
+                            manual_pnl = (entry - mark) * abs(size)
+                        open_pnl = manual_pnl
+                        logging.info(
+                            f"{open_acc_name}: Manual unrealized PnL: "
+                            f"size={size:.4f}, entry={entry:.2f}, mark={mark:.2f} -> PnL={open_pnl:.6f}"
+                        )
+                    
+                    # Рассчитываем разницу (берем абсолютные значения для сравнения)
+                    pnl_diff = abs(closed_position_pnl) - abs(open_pnl)
+                    logging.info(f"Разница PnL: |{closed_position_pnl}| - |{open_pnl}| = {pnl_diff}")
+                    
+                    # Проверяем условие закрытия в зависимости от знака разницы
+                    if pnl_diff < 0 and pnl_diff < pnl_diff_min_threshold:
+                        # Отрицательная разница ниже порога - закрываем позицию
+                        logging.warning(f"Отрицательная разница PnL ({pnl_diff}) ниже минимального порога ({pnl_diff_min_threshold}). Закрываем оставшуюся позицию.")
+                        close_success = close_position_market(open_trader, symbol, open_position, open_acc_name)
+                        if close_success:
+                            logging.info(f"{open_acc_name}: Позиция успешно закрыта по условию минимальной разницы PnL")
+                        else:
+                            logging.error(f"{open_acc_name}: Не удалось закрыть позицию по условию минимальной разницы PnL")
+                        # Независимо от результата, считаем логику завершенной
+                        time_position_closed = None
+                        closed_position_pnl = None
+                        closed_position_account = None
+                    elif pnl_diff > 0 and pnl_diff > pnl_diff_max_threshold:
+                        # Положительная разница выше порога - закрываем позицию
+                        logging.warning(f"Положительная разница PnL ({pnl_diff}) выше максимального порога ({pnl_diff_max_threshold}). Закрываем оставшуюся позицию.")
+                        close_success = close_position_market(open_trader, symbol, open_position, open_acc_name)
+                        if close_success:
+                            logging.info(f"{open_acc_name}: Позиция успешно закрыта по условию максимальной разницы PnL")
+                        else:
+                            logging.error(f"{open_acc_name}: Не удалось закрыть позицию по условию максимальной разницы PnL")
+                        # Независимо от результата, считаем логику завершенной
+                        time_position_closed = None
+                        closed_position_pnl = None
+                        closed_position_account = None
+                    else:
+                        # Если разница в допустимых пределах, ждем следующей проверки
+                        if pnl_diff < 0:
+                            logging.info(f"Отрицательная разница PnL ({pnl_diff}) в допустимых пределах (выше {pnl_diff_min_threshold})")
+                        else:
+                            logging.info(f"Положительная разница PnL ({pnl_diff}) в допустимых пределах (ниже {pnl_diff_max_threshold})")
+                        # Подготавливаем время для следующей проверки
+                        time_position_closed = time.time() - pnl_diff_check_delay + pnl_diff_recheck_interval
+            
+            # Check if both positions are closed
+            if not short_active and not long_active:
+                # Double-check with a small delay to make sure it's not just API flakiness
+                time.sleep(3)
+                
+                # Re-check positions
                 short_pos = short_tr.get_position(symbol)
                 long_pos = long_tr.get_position(symbol)
                 
-                # Check if both positions exist
-                short_active = short_pos and float(short_pos.get("netQuantity", 0)) != 0
-                long_active = long_pos and float(long_pos.get("netQuantity", 0)) != 0
+                short_active = short_pos and abs(float(short_pos.get("netQuantity", 0) or 0)) > 0.01
+                long_active = long_pos and abs(float(long_pos.get("netQuantity", 0) or 0)) > 0.01
                 
-                # Log position details if active
-                if short_active:
-                    s = float(short_pos.get("netQuantity", 0))
-                    e = float(short_pos.get("entryPrice", 0))
-                    m = float(short_pos.get("markPrice", 0))
-                    l = short_pos.get("estLiquidationPrice", "Unknown")
-                    pnl = short_pos.get("unrealizedPnl", "---")
-                    logging.info(f"{short_acc_name}: Short position: size={s:.2f}, entry={e}, mark={m}, liquidation={l}, PnL={pnl}")
-                else:
-                    logging.info(f"{short_acc_name}: No active short position found")
-                
-                if long_active:
-                    s = float(long_pos.get("netQuantity", 0))
-                    e = float(long_pos.get("entryPrice", 0))
-                    m = float(long_pos.get("markPrice", 0))
-                    l = long_pos.get("estLiquidationPrice", "Unknown")
-                    pnl = long_pos.get("unrealizedPnl", "---")
-                    logging.info(f"{long_acc_name}: Long position: size={s:.2f}, entry={e}, mark={m}, liquidation={l}, PnL={pnl}")
-                else:
-                    logging.info(f"{long_acc_name}: No active long position found")
-                
-                # Check if both positions are closed - use the explicit check with short_active and long_active flags
                 if not short_active and not long_active:
-                    # Double-check with a small delay to make sure it's not just API flakiness
-                    time.sleep(3)
-                    
-                    # Re-check positions
-                    short_pos = short_tr.get_position(symbol)
-                    long_pos = long_tr.get_position(symbol)
-                    
-                    short_active = short_pos and float(short_pos.get("netQuantity", 0)) != 0
-                    long_active = long_pos and float(long_pos.get("netQuantity", 0)) != 0
-                    
-                    if not short_active and not long_active:
-                        logging.info("Both positions confirmed closed. Moving to sweep phase.")
-                        break
-                
-                # If we've been monitoring for more than 1 hour, implement safety checks
-                if time.time() - start_monitoring > 3600:
-                    # If we haven't seen any positions in a long time, something might be wrong
-                    if not short_active and not long_active:
-                        logging.warning("No positions found after 1 hour of monitoring. Moving to sweep phase.")
-                        break
-                
-                time.sleep(check_int)
-        except Exception as e:
-            logging.error(f"Error during position monitoring: {e}")
-            traceback.print_exc()
+                    logging.info("Both positions confirmed closed. Moving to sweep phase.")
+                    break
+            
+            # If we've been monitoring for more than 1 hour, implement safety checks
+            if time.time() - start_monitoring > 3600:
+                # If we haven't seen any positions in a long time, something might be wrong
+                if not short_active and not long_active:
+                    logging.warning("No positions found after 1 hour of monitoring. Moving to sweep phase.")
+                    break
+            
+            time.sleep(check_int)
+            
+    except Exception as e:
+        logging.error(f"Error during position monitoring: {e}")
+        traceback.print_exc()
 
         # 6) Sweep ALL remaining funds FROM sub-accounts TO parent account
         # …после мониторинга и подтверждения закрытия позиций…
