@@ -20,6 +20,13 @@ deviation:
   # Максимальное отклонение от initial_deposit в долях (пример 0.01 = 1%)
   max_deviation: 0.05
 
+# Контроль разницы PnL
+pnl_diff:
+  check_delay_seconds: 10        # Wait 10 seconds after a position closes before checking PnL
+  min_threshold: -2.00           # Максимум профита от вилки (со знаком -) (Когда открытая поза в ПЛЮСЕ, относительно закрытой)
+  max_threshold: 0.75            # Максимум рект от вилки (со знаком +) (Когда открытая поза в МИНУСЕ, относительно закрытой)
+  recheck_interval_seconds: 30   # How often to recheck if within limits
+  
 # Trading pairs configuration
 pairs:
   - short_account:
